@@ -72,6 +72,17 @@ def check_pause_conditions(con) -> list[str]:
             ks = ks_2samp(feats[col].dropna(), ref[col].dropna()).statistic
             if ks > settings.KS_DRIFT_PAUSE:
                 warnings.append(f"Feature drift pause: {col} KS={ks:.3f}")
+            elif ks > settings.KS_DRIFT_ALERT:
+                warnings.append(f"Feature drift alert: {col} KS={ks:.3f}")
+
+    sigs_with_lift = sigs[sigs["signal"].isin(["LONG", "SHORT"])]
+    if len(sigs_with_lift) >= 20:
+        lifts = sigs_with_lift["p_magnitude"] - 0.5
+        avg_lift = float(lifts.mean())
+        if avg_lift < settings.MARGINAL_AUC_MIN:
+            warnings.append(
+                f"Marginal lift below minimum ({avg_lift:.3f} < {settings.MARGINAL_AUC_MIN})"
+            )
 
     return warnings
 

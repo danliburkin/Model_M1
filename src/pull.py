@@ -38,6 +38,7 @@ import settings
 log = logging.getLogger(__name__)
 
 NYSE = xcals.get_calendar("XNYS")
+_SCHEMA_APPLIED = False
 
 
 def last_trading_day(d: date | None = None) -> date:
@@ -51,10 +52,9 @@ def last_trading_day(d: date | None = None) -> date:
 
 def _yf_end_exclusive(as_of: date) -> str:
     """yfinance end date (exclusive) covering as_of session."""
-    nxt = NYSE.next_session(pd.Timestamp(as_of)) if NYSE.is_session(pd.Timestamp(as_of)) else pd.Timestamp(as_of)
-    if NYSE.is_session(pd.Timestamp(as_of)):
-        nxt = NYSE.next_session(pd.Timestamp(as_of))
-        return nxt.date().isoformat()
+    ts = pd.Timestamp(as_of)
+    if NYSE.is_session(ts):
+        return NYSE.next_session(ts).date().isoformat()
     return (as_of + timedelta(days=1)).isoformat()
 
 
@@ -98,14 +98,24 @@ def _redact_secrets(text: str) -> str:
 
 
 def get_db() -> duckdb.DuckDBPyConnection:
+    global _SCHEMA_APPLIED
     settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
     con = duckdb.connect(str(settings.DB_PATH))
-    if settings.SCHEMA_PATH.exists():
+    if not _SCHEMA_APPLIED and settings.SCHEMA_PATH.exists():
         con.execute(settings.SCHEMA_PATH.read_text())
+        con.execute(
+            "ALTER TABLE features_daily ADD COLUMN IF NOT EXISTS iv_minus_ewma_rv DOUBLE"
+        )
+        _SCHEMA_APPLIED = True
     return con
 
 
-def polygon_get(url: str, params: Optional[dict] = None, max_retries: int = 4) -> requests.Response:
+def polygon_get(
+    url: str,
+    params: Optional[dict] = None,
+    max_retries: int = 4,
+    log_con: Optional[duckdb.DuckDBPyConnection] = None,
+) -> requests.Response:
     """GET with token-bucket rate limit, logging, and exponential backoff on 429."""
     _require_keys()
     params = dict(params or {})
@@ -136,15 +146,14 @@ def polygon_get(url: str, params: Optional[dict] = None, max_retries: int = 4) -
         elapsed_ms = (time.monotonic() - t0) * 1000
         log.info("Polygon GET url=%s status=%s elapsed_ms=%.0f", safe_url, r.status_code, elapsed_ms)
 
-        try:
-            con = get_db()
-            con.execute(
-                "INSERT INTO pull_log VALUES (?, ?, ?, ?)",
-                [datetime.now(), safe_url[:2000], r.status_code, elapsed_ms],
-            )
-            con.close()
-        except Exception:
-            pass
+        if log_con is not None:
+            try:
+                log_con.execute(
+                    "INSERT INTO pull_log VALUES (?, ?, ?, ?)",
+                    [datetime.now(), safe_url[:2000], r.status_code, elapsed_ms],
+                )
+            except Exception as exc:
+                log.debug("pull_log insert failed: %s", exc)
 
         if r.status_code == 429 and attempt < max_retries - 1:
             log.warning("Polygon 429 — backing off %.0fs (attempt %d)", backoff, attempt + 1)
@@ -346,38 +355,6 @@ def fetch_options_chain(ticker: str, as_of: str) -> list[dict]:
     return results
 
 
-def fetch_options_history(contract_ticker: str, start: str, end: str) -> list[dict]:
-    """Fetch daily OHLCV history for one contract (backfill)."""
-    url = f"{settings.POLYGON_BASE}/v2/aggs/ticker/{contract_ticker}/range/1/day/{start}/{end}"
-    r = polygon_get(url, {"adjusted": "true", "sort": "asc", "limit": 50000})
-    if not r.ok:
-        return []
-    meta = r.json()
-    underlying = contract_ticker.split(":")[1][:4] if ":" in contract_ticker else ""
-    m = re.match(r"O:([A-Z]+)(\d{6})([CP])(\d{8})", contract_ticker.replace(":", ""))
-    rows: list[dict] = []
-    for bar in meta.get("results", []):
-        ts = datetime.utcfromtimestamp(bar["t"] / 1000).date()
-        rows.append(
-            {
-                "date": ts,
-                "ticker": contract_ticker,
-                "underlying": underlying or contract_ticker,
-                "strike": 0.0,
-                "expiry": None,
-                "contract_type": "call" if "C" in contract_ticker else "put",
-                "open": bar.get("o"),
-                "high": bar.get("h"),
-                "low": bar.get("l"),
-                "close": bar.get("c"),
-                "volume": bar.get("v"),
-                "vwap": bar.get("vw"),
-                "transactions": int(bar.get("n", 0)),
-            }
-        )
-    return rows
-
-
 def list_contracts_for_backfill(ticker: str, as_of: str) -> list[dict]:
     """List contract metadata for backfill scope."""
     as_of_date = datetime.strptime(as_of, "%Y-%m-%d").date()
@@ -420,9 +397,11 @@ def list_contracts_for_backfill(ticker: str, as_of: str) -> list[dict]:
 
 def fetch_market_indices(start: str, end: str) -> pd.DataFrame:
     """VIX and VIX3M from yfinance."""
+    end_date = datetime.strptime(end, "%Y-%m-%d").date()
+    yf_end = _yf_end_exclusive(end_date)
     rows: list[dict] = []
     for sym, col in [("^VIX", "vix"), ("^VIX3M", "vix3m")]:
-        df = yf.download(sym, start=start, end=end, progress=False)
+        df = yf.download(sym, start=start, end=yf_end, progress=False)
         for idx, row in df.iterrows():
             d = idx.date() if hasattr(idx, "date") else idx
             existing = next((r for r in rows if r["date"] == d), None)
@@ -536,11 +515,11 @@ def run(as_of: str, tickers: Optional[list[str]] = None) -> None:
 
     store_options(con, all_opts)
 
+    as_of_date = datetime.strptime(as_of, "%Y-%m-%d").date()
     mkt = fetch_market_indices(start, as_of)
     fred = fetch_fred_series(start, as_of)
     cboe = fetch_cboe_metrics(as_of)
 
-    as_of_date = datetime.strptime(as_of, "%Y-%m-%d").date()
     row: dict[str, Any] = {"date": as_of_date}
     if not mkt.empty:
         m = mkt[mkt["date"] == as_of_date]

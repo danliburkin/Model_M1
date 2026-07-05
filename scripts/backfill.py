@@ -11,6 +11,8 @@ import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+import pandas as pd
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
@@ -20,12 +22,17 @@ load_dotenv(ROOT / ".env")
 
 import settings
 from src.pull import (
+    fetch_fred_series,
+    fetch_market_indices,
     fetch_ndx_members,
+    fetch_stock_ohlcv,
     get_db,
     last_trading_day,
     list_contracts_for_backfill,
     polygon_get,
+    store_market,
     store_options,
+    store_stocks,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -62,7 +69,7 @@ def main() -> None:
                 f"{settings.POLYGON_BASE}/v2/aggs/ticker/{ct}/range/1/day/"
                 f"{start.isoformat()}/{end.isoformat()}"
             )
-            r = polygon_get(url, {"adjusted": "true", "sort": "asc", "limit": 50000})
+            r = polygon_get(url, {"adjusted": "true", "sort": "asc", "limit": 50000}, log_con=con)
             if not r.ok:
                 log.warning("Failed %s: %s", ct, r.status_code)
                 continue
@@ -96,6 +103,25 @@ def main() -> None:
                 [ticker, ct, end],
             )
             log.info("  %s: %d bars", ct, len(rows))
+
+    log.info("Pulling stock OHLCV for %d tickers", len(tickers))
+    stocks = fetch_stock_ohlcv(tickers + [settings.UNIVERSE_TICKER], start.isoformat(), end.isoformat())
+    store_stocks(con, stocks)
+
+    log.info("Pulling market indices and FRED series")
+    mkt = fetch_market_indices(start.isoformat(), end.isoformat())
+    fred = fetch_fred_series(start.isoformat(), end.isoformat())
+    for _, mrow in mkt.iterrows():
+        d = mrow["date"]
+        if hasattr(d, "date"):
+            d = d.date() if hasattr(d, "date") else d
+        frow = fred[fred["date"] == mrow["date"]] if not fred.empty else pd.DataFrame()
+        row = {"date": d, "vix": mrow.get("vix"), "vix3m": mrow.get("vix3m")}
+        if not frow.empty:
+            for c in ("hy_oas", "t_bill_3m"):
+                if c in frow.columns:
+                    row[c] = frow.iloc[0][c]
+        store_market(con, row)
 
     con.close()
     log.info("Backfill complete")

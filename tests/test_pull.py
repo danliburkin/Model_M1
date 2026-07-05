@@ -50,15 +50,18 @@ def test_polygon_get_logs_and_returns(mock_requests):
     mock_resp.ok = True
     mock_requests.return_value = mock_resp
 
+    mock_con = MagicMock()
     with patch("src.pull.settings.POLYGON_API_KEY", "test_key"):
-        r = polygon_get("https://api.polygon.io/v3/reference/options/contracts", {"limit": 1})
+        r = polygon_get(
+            "https://api.polygon.io/v3/reference/options/contracts",
+            {"limit": 1},
+            log_con=mock_con,
+        )
     assert r.status_code == 200
+    mock_con.execute.assert_called_once()
 
 
 @pytest.fixture
 def mock_requests():
     with patch("src.pull.requests.get") as m:
-        with patch("src.pull.get_db") as dbm:
-            dbm.return_value.execute = MagicMock()
-            dbm.return_value.close = MagicMock()
-            yield m
+        yield m

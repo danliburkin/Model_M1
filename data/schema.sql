@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS features_daily (
     ticker          VARCHAR     NOT NULL,
     iv_atm_30dte            DOUBLE,
     iv_pct_rank_252d        DOUBLE,
+    iv_minus_ewma_rv        DOUBLE,
     z_iv_minus_ewma_rv      DOUBLE,
     skew_pct_rank_252d      DOUBLE,
     term_structure_60_30    DOUBLE,

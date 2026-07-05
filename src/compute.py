@@ -49,7 +49,7 @@ def compute_iv(
     except Exception:
         log.debug("BSM IV failed S=%.2f K=%.2f T=%.4f mid=%.4f", S, K, T, mid_price)
         return None
-    if iv < 0.01 or iv > 5.0:
+    if iv < settings.IV_CLAMP_MIN or iv > settings.IV_CLAMP_MAX:
         return None
     return iv
 
@@ -82,7 +82,7 @@ def compute_contract_ivs(con: duckdb.DuckDBPyConnection, as_of: str) -> None:
     mkt = con.execute(
         "SELECT t_bill_3m FROM market_daily WHERE date = ?", [as_of]
     ).fetchone()
-    r = float(mkt[0]) if mkt and mkt[0] is not None else 0.05
+    r = float(mkt[0]) if mkt and mkt[0] is not None else settings.DEFAULT_RISK_FREE_RATE
 
     updates: list[tuple] = []
     for _, row in rows.iterrows():
@@ -105,13 +105,22 @@ def compute_contract_ivs(con: duckdb.DuckDBPyConnection, as_of: str) -> None:
         g = bs_gamma(flag_char=fc, S=float(S), K=float(row["strike"]), t=T, r=r, sigma=iv)
         updates.append((mid, iv, float(d), float(g), row["ticker"], as_of))
 
-    for mid, iv, d, g, ticker, dt in updates:
+    if updates:
+        upd = pd.DataFrame(
+            updates,
+            columns=["mid_price", "iv_computed", "delta", "gamma", "ticker", "date"],
+        )
+        con.register("_iv_upd", upd)
         con.execute(
             """
-            UPDATE options_daily SET mid_price=?, iv_computed=?, delta=?, gamma=?
-            WHERE date=? AND ticker=?
-            """,
-            [mid, iv, d, g, dt, ticker],
+            UPDATE options_daily o SET
+                mid_price = _iv_upd.mid_price,
+                iv_computed = _iv_upd.iv_computed,
+                delta = _iv_upd.delta,
+                gamma = _iv_upd.gamma
+            FROM _iv_upd
+            WHERE o.date = _iv_upd.date AND o.ticker = _iv_upd.ticker
+            """
         )
 
 
@@ -256,8 +265,12 @@ def compute_features_for_date(con: duckdb.DuckDBPyConnection, as_of: str) -> Non
         iv_pct = _pct_rank(iv_series).iloc[-1] if iv_atm else None
 
         rv_row = stock_hist[stock_hist["date"] == pd.Timestamp(as_of)]
-        ewma_rv = math.sqrt(float(rv_row["ewma_var"].iloc[0]) * 252) if not rv_row.empty and pd.notna(rv_row["ewma_var"].iloc[0]) else None
-        z_iv_minus_rv = ((iv_atm - ewma_rv) if iv_atm and ewma_rv else None)
+        ewma_rv = (
+            math.sqrt(float(rv_row["ewma_var"].iloc[0]) * 252)
+            if not rv_row.empty and pd.notna(rv_row["ewma_var"].iloc[0])
+            else None
+        )
+        iv_minus_rv = (iv_atm - ewma_rv) if iv_atm and ewma_rv else None
 
         skew_series = pd.concat(
             [
@@ -300,18 +313,21 @@ def compute_features_for_date(con: duckdb.DuckDBPyConnection, as_of: str) -> Non
         oas_chg = oas_hist.diff(5)
         z_oas = float(_rolling_z(oas_chg).iloc[-1]) if len(oas_chg) > 60 else None
 
-        # Z-score iv_minus_rv against history
-        z_iv_rv_hist = con.execute(
-            "SELECT z_iv_minus_ewma_rv FROM features_daily WHERE ticker = ? ORDER BY date",
+        iv_minus_hist = con.execute(
+            "SELECT iv_minus_ewma_rv FROM features_daily WHERE ticker = ? ORDER BY date",
             [ticker],
         ).fetchdf()
-        z_iv_rv_series = pd.concat(
+        iv_minus_series = pd.concat(
             [
-                z_iv_rv_hist["z_iv_minus_ewma_rv"] if not z_iv_rv_hist.empty else pd.Series(dtype=float),
-                pd.Series([z_iv_minus_rv]),
+                iv_minus_hist["iv_minus_ewma_rv"]
+                if not iv_minus_hist.empty
+                else pd.Series(dtype=float),
+                pd.Series([iv_minus_rv]),
             ]
         )
-        z_iv_minus_ewma_rv = float(_rolling_z(z_iv_rv_series).iloc[-1]) if z_iv_minus_rv else None
+        z_iv_minus_ewma_rv = (
+            float(_rolling_z(iv_minus_series).iloc[-1]) if iv_minus_rv is not None else None
+        )
 
         feature_rows.append(
             {
@@ -319,6 +335,7 @@ def compute_features_for_date(con: duckdb.DuckDBPyConnection, as_of: str) -> Non
                 "ticker": ticker,
                 "iv_atm_30dte": iv_atm,
                 "iv_pct_rank_252d": iv_pct,
+                "iv_minus_ewma_rv": iv_minus_rv,
                 "z_iv_minus_ewma_rv": z_iv_minus_ewma_rv,
                 "skew_pct_rank_252d": skew_pct,
                 "term_structure_60_30": term_structure,
@@ -354,3 +371,32 @@ def run(as_of: str) -> None:
     compute_features_for_date(con, as_of)
     con.close()
     log.info("Compute complete for %s", as_of)
+
+
+def run_range(start: str | None = None, end: str | None = None) -> None:
+    """Compute IV and features for every options date in range (for backfill)."""
+    con = get_db()
+    _realized_vol_and_ewma(con)
+
+    if start and end:
+        dates = con.execute(
+            """
+            SELECT DISTINCT date FROM options_daily
+            WHERE date >= ? AND date <= ?
+            ORDER BY date
+            """,
+            [start, end],
+        ).fetchall()
+    else:
+        dates = con.execute(
+            "SELECT DISTINCT date FROM options_daily ORDER BY date"
+        ).fetchall()
+
+    for i, (d,) in enumerate(dates):
+        as_of = d.isoformat() if hasattr(d, "isoformat") else str(d)
+        log.info("Computing features %d/%d: %s", i + 1, len(dates), as_of)
+        compute_contract_ivs(con, as_of)
+        compute_features_for_date(con, as_of)
+
+    con.close()
+    log.info("Compute history complete (%d dates)", len(dates))
