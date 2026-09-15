@@ -101,8 +101,8 @@ def compute_contract_ivs(con: duckdb.DuckDBPyConnection, as_of: str) -> None:
             updates.append((mid, None, None, None, row["ticker"], as_of))
             continue
         fc = "c" if flag == "call" else "p"
-        d = bs_delta(flag_char=fc, S=float(S), K=float(row["strike"]), t=T, r=r, sigma=iv)
-        g = bs_gamma(flag_char=fc, S=float(S), K=float(row["strike"]), t=T, r=r, sigma=iv)
+        d = bs_delta(flag=fc, S=float(S), K=float(row["strike"]), t=T, r=r, sigma=iv)
+        g = bs_gamma(flag=fc, S=float(S), K=float(row["strike"]), t=T, r=r, sigma=iv)
         updates.append((mid, iv, float(d), float(g), row["ticker"], as_of))
 
     if updates:
