@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-One-time: pull 2 years of options OHLCV history from Polygon.
-Resumable via backfill_progress table.
+Pull options OHLCV history from Polygon.
+
+Checks MAX(date) per underlying and pulls only the gap when data is recent.
+Full 2024-09-15 window is used on first run or when last bar is >30 days old.
+Contract-level resume via backfill_progress still applies to full pulls.
 """
 
 from __future__ import annotations
 
 import logging
 import sys
-from datetime import date, datetime, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -22,6 +25,8 @@ load_dotenv(ROOT / ".env")
 
 import settings
 from src.pull import (
+    BACKFILL_FULL_START,
+    backfill_range_for_ticker,
     fetch_fred_series,
     fetch_market_indices,
     fetch_ndx_members,
@@ -41,15 +46,20 @@ log = logging.getLogger("backfill")
 
 def main() -> None:
     end = last_trading_day()
-    start = end - timedelta(days=365 * settings.TRAINING_WINDOW_YEARS)
+    full_start = BACKFILL_FULL_START
     as_of = end.isoformat()
     tickers = fetch_ndx_members()
     con = get_db()
 
-    log.info("Backfill %s to %s for %d tickers", start, end, len(tickers))
+    log.info("Backfill %s to %s for %d tickers", full_start, end, len(tickers))
 
     for i, ticker in enumerate(tickers):
         log.info("Ticker %d/%d: %s", i + 1, len(tickers), ticker)
+        start, reason = backfill_range_for_ticker(con, ticker, end, full_start=full_start)
+        log.info("ticker %s: pulling %s to today (%s)", ticker, start.isoformat(), reason)
+        if start > end:
+            continue
+
         try:
             contracts = list_contracts_for_backfill(ticker, as_of)
         except Exception as exc:
@@ -58,12 +68,13 @@ def main() -> None:
 
         for c in contracts:
             ct = c["ticker"]
-            done = con.execute(
-                "SELECT last_date FROM backfill_progress WHERE ticker = ? AND contract_ticker = ?",
-                [ticker, ct],
-            ).fetchone()
-            if done and done[0] and done[0] >= end:
-                continue
+            if start == full_start:
+                done = con.execute(
+                    "SELECT last_date FROM backfill_progress WHERE ticker = ? AND contract_ticker = ?",
+                    [ticker, ct],
+                ).fetchone()
+                if done and done[0] and done[0] >= end:
+                    continue
 
             url = (
                 f"{settings.POLYGON_BASE}/v2/aggs/ticker/{ct}/range/1/day/"
@@ -76,7 +87,7 @@ def main() -> None:
 
             rows = []
             for bar in r.json().get("results", []):
-                ts = datetime.utcfromtimestamp(bar["t"] / 1000).date()
+                ts = datetime.fromtimestamp(bar["t"] / 1000, tz=timezone.utc).date()
                 rows.append(
                     {
                         "date": ts,
@@ -105,12 +116,14 @@ def main() -> None:
             log.info("  %s: %d bars", ct, len(rows))
 
     log.info("Pulling stock OHLCV for %d tickers", len(tickers))
-    stocks = fetch_stock_ohlcv(tickers + [settings.UNIVERSE_TICKER], start.isoformat(), end.isoformat())
+    stocks = fetch_stock_ohlcv(
+        tickers + [settings.UNIVERSE_TICKER], full_start.isoformat(), end.isoformat()
+    )
     store_stocks(con, stocks)
 
     log.info("Pulling market indices and FRED series")
-    mkt = fetch_market_indices(start.isoformat(), end.isoformat())
-    fred = fetch_fred_series(start.isoformat(), end.isoformat())
+    mkt = fetch_market_indices(full_start.isoformat(), end.isoformat())
+    fred = fetch_fred_series(full_start.isoformat(), end.isoformat())
     for _, mrow in mkt.iterrows():
         d = mrow["date"]
         if hasattr(d, "date"):

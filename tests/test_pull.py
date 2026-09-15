@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import os
 import time
+from datetime import date
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.pull import PolygonRateLimiter, fetch_ndx_members
+from src.pull import PolygonRateLimiter, backfill_range_for_ticker, fetch_ndx_members
 
 
 def test_rate_limiter_enforces_window():
@@ -59,6 +60,37 @@ def test_polygon_get_logs_and_returns(mock_requests):
         )
     assert r.status_code == 200
     mock_con.execute.assert_called_once()
+
+
+def _options_con(rows: list[tuple[str, str]] | None = None):
+    import duckdb
+
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE TABLE options_daily (date DATE, underlying VARCHAR)")
+    if rows:
+        con.executemany("INSERT INTO options_daily VALUES (?, ?)", rows)
+    return con
+
+
+def test_backfill_range_first_run():
+    con = _options_con()
+    start, reason = backfill_range_for_ticker(con, "AAPL", date(2026, 9, 15))
+    assert start == date(2024, 9, 15)
+    assert reason == "first run"
+
+
+def test_backfill_range_incremental_recent():
+    con = _options_con([("2026-09-09", "AAPL")])
+    start, reason = backfill_range_for_ticker(con, "AAPL", date(2026, 9, 15))
+    assert start == date(2026, 9, 10)
+    assert reason == "incremental, last: 2026-09-09"
+
+
+def test_backfill_range_stale_full_pull():
+    con = _options_con([("2026-07-01", "AAPL")])
+    start, reason = backfill_range_for_ticker(con, "AAPL", date(2026, 9, 15))
+    assert start == date(2024, 9, 15)
+    assert reason == "first run"
 
 
 @pytest.fixture

@@ -355,6 +355,46 @@ def fetch_options_chain(ticker: str, as_of: str) -> list[dict]:
     return results
 
 
+BACKFILL_FULL_START = date(2024, 9, 15)
+BACKFILL_RECENT_DAYS = 5
+BACKFILL_STALE_DAYS = 30
+
+
+def backfill_range_for_ticker(
+    con: duckdb.DuckDBPyConnection,
+    ticker: str,
+    end: date,
+    *,
+    full_start: date | None = None,
+    recent_days: int = BACKFILL_RECENT_DAYS,
+    stale_days: int = BACKFILL_STALE_DAYS,
+) -> tuple[date, str]:
+    """Choose the options pull window from existing DB history.
+
+    - No rows, or last bar older than ``stale_days``: full history from 2024-09-15.
+    - Last bar within ``stale_days`` (typical nightly case: last 5 days):
+      incremental from max_date + 1.
+    """
+    full_start = full_start or BACKFILL_FULL_START
+    row = con.execute(
+        "SELECT MAX(date) FROM options_daily WHERE underlying = ?",
+        [ticker],
+    ).fetchone()
+    max_date = row[0] if row else None
+    if isinstance(max_date, datetime):
+        max_date = max_date.date()
+
+    if max_date is None:
+        return full_start, "first run"
+
+    age = (end - max_date).days
+    if age <= recent_days:
+        return max_date + timedelta(days=1), f"incremental, last: {max_date}"
+    if age > stale_days:
+        return full_start, "first run"
+    return max_date + timedelta(days=1), f"incremental, last: {max_date}"
+
+
 def list_contracts_for_backfill(ticker: str, as_of: str) -> list[dict]:
     """List contract metadata for backfill scope."""
     as_of_date = datetime.strptime(as_of, "%Y-%m-%d").date()
